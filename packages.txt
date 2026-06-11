@@ -1,0 +1,36 @@
+# packages.txt — one pacman package per line. Comments (#) and blanks ignored.
+# Installed with: pacman -S --needed   (idempotent)
+
+# Shell + editor
+fish
+neovim
+git
+
+# Build toolchain (needed for DKMS / AUR builds, e.g. the RTL8812AU driver)
+base-devel
+dkms
+
+# USB + network tooling
+usbutils            # lsusb — used to detect the AWUS036ACH adapter
+networkmanager      # nmcli
+wireless_tools
+iw
+
+# Remote access (also handled explicitly in init.sh)
+openssh
+tailscale
+
+# Claude Code runtime (also handled explicitly in init.sh)
+nodejs
+npm
+
+# Quality-of-life
+htop
+ripgrep
+fd
+curl
+wget
+
+# NOTE: the AWUS036ACH (Realtek RTL8812AU) driver package
+# 'rtl8812au-dkms-git' is installed by setup_awus036ach() in init.sh,
+# because it usually comes from the AUR and needs an AUR helper (paru).

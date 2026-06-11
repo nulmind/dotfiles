@@ -1,0 +1,11 @@
+# ~/.ssh/config — chmod 600
+# Convenience host entries. Adjust to taste.
+
+Host *
+    ServerAliveInterval 60
+    ServerAliveCountMax 3
+
+# Example: reach this box from your tailnet by name once Tailscale is up.
+# Host cachyos
+#     HostName <tailscale-ip-or-magicdns-name>
+#     User michael

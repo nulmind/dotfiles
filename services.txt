@@ -1,0 +1,6 @@
+# services.txt — one systemd unit per line to `enable --now`.
+# Comments (#) and blank lines are ignored.
+
+NetworkManager
+sshd
+tailscaled

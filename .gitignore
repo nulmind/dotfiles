@@ -1,0 +1,6 @@
+# Never commit secrets
+.env
+
+# Editor / OS noise
+*.swp
+.DS_Store
