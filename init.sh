@@ -3,7 +3,7 @@
 # init.sh — CachyOS live-environment bootstrap
 # --------------------------------------------
 # Curl this down on first boot:
-#   curl -fsSL https://raw.githubusercontent.com/YOU/dotfiles/main/init.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/nulmind/dotfiles/main/init.sh | bash
 #
 # Order is deliberate so you can hand off to remote/agent config early:
 #   network → packages → AWUS036ACH driver → SSH → Tailscale → Claude Code → dotfiles
