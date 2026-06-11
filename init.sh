@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-DOTFILES="${DOTFILES:-https://raw.githubusercontent.com/YOU/dotfiles/main}"
+DOTFILES="${DOTFILES:-https://raw.githubusercontent.com/nulmind/dotfiles/main}"
 
 # Load local overrides / secrets if present (kept out of git via .gitignore).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
