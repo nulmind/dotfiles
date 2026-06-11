@@ -110,7 +110,7 @@ pac() {
 # ── 3. Core packages ───────────────────────────────────────────
 echo "── Installing packages ──"
 if curl -fsSL "${DOTFILES}/packages.txt" -o /tmp/packages.txt 2>/dev/null; then
-  mapfile -t PKGS < <(grep -vE '^\s*#|^\s*$' /tmp/packages.txt)
+  mapfile -t PKGS < <(sed 's/#.*//' /tmp/packages.txt | grep -vE '^\s*$')
   (( ${#PKGS[@]} )) && pac "${PKGS[@]}"
 else
   echo "(Could not fetch packages.txt — skipping bulk package install.)"

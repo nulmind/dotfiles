@@ -6,10 +6,6 @@ fish
 neovim
 git
 
-# Build toolchain (needed for DKMS / AUR builds, e.g. the RTL8812AU driver)
-base-devel
-dkms
-
 # USB + network tooling
 usbutils            # lsusb — used to detect the AWUS036ACH adapter
 networkmanager      # nmcli
