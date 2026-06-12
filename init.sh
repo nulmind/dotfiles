@@ -313,30 +313,32 @@ echo "✅  Claude Code installed. Test with: claude --version"
 
 # ── Model registry: tag → download size in GiB ─────────────────
 declare -A LLM_TAGS=(
-  # GPU ≥30GB (RTX 5090): qwen3:32b — best tool-use + hybrid thinking mode; 34 tok/s on RTX 4090
-  # Qwen3-Coder-Next 80B (58.7% SWE-bench) needs 48GB VRAM+RAM — too large for single GPU
-  [gpu_large_primary]="qwen3:32b-q4_K_M"
-  [gpu_large_primary_sz]=20
-  # GPU ≥22GB (RTX 3090): qwen2.5-coder:32b — best raw coding benchmark (HumanEval 92.7%)
-  [gpu_mid_primary]="qwen2.5-coder:32b-instruct-q4_K_M"
-  [gpu_mid_primary_sz]=20
-  # GPU ≥10GB: gemma4:12b-it-qat — QAT beats standard Q4_K_M at ~7GB; multimodal, 256K ctx
-  # QAT (Quantization-Aware Training) bakes compression into training; ~72% mem reduction, near-original quality
+  # GPU ≥30GB (RTX 5090): qwen3-coder-next 80B MoE, 3B active per token — 58.7% SWE-bench
+  # Needs 32GB VRAM + ~16GB RAM offload; official Ollama tag; 256K ctx; 38-48 tok/s on 5090
+  [gpu_large_primary]="qwen3-coder-next:q4_K_M"
+  [gpu_large_primary_sz]=48   # combined VRAM+RAM; disk size ~48GB
+  # GPU ≥22GB (RTX 3090): gemma4:31b-it-qat — best QAT model; 80% LiveCodeBench, ~18GB
+  # For pure FIM autocomplete, qwen2.5-coder:32b (92.7% HumanEval) is still king — set LOCAL_LLM_MODEL to override
+  [gpu_mid_primary]="gemma4:31b-it-qat"
+  [gpu_mid_primary_sz]=18
+  # GPU ≥10GB: gemma4:12b-it-qat — QAT beats standard PTQ at ~7GB; multimodal, 256K ctx, 72% LiveCodeBench
+  # QAT (Quantization-Aware Training): Google bakes 4-bit tolerance into training; ~72% mem cut, near-FP16 quality
   [gpu_small_primary]="gemma4:12b-it-qat"
   [gpu_small_primary_sz]=7
-  # GPU router: always-hot classifier, tiny footprint
+  # GPU router: always-hot classifier — stays loaded between queries (keep_alive=-1)
   [gpu_router]="qwen2.5:7b-instruct-q4_K_M"
   [gpu_router_sz]=5
-  # CPU ≥80GB RAM: gemma4:12b-it-qat — 7GB vs 16GB for deepseek q8, faster inference, QAT quality
-  [cpu_large_primary]="gemma4:12b-it-qat"
-  [cpu_large_primary_sz]=7
-  # CPU ≥48GB RAM: phi4 Q4_K_M — best reasoning/math at 14B on CPU
+  # CPU ≥80GB RAM: qwen3-coder-next Q4_K_M — 52GB RAM; MoE means only 3B active per token
+  # 8-12 tok/s on CPU but 256K context and 58.7% SWE-bench; use SKIP_LLM=1 to pull later on bigger drive
+  [cpu_large_primary]="qwen3-coder-next:q4_K_M"
+  [cpu_large_primary_sz]=52
+  # CPU ≥48GB RAM: phi4:14b-q4_K_M — best reasoning/math at 14B; ~9GB, 15-20 tok/s
   [cpu_mid_primary]="phi4:14b-q4_K_M"
   [cpu_mid_primary_sz]=9
-  # CPU ≥14GB RAM: qwen2.5-coder Q5_K_M — step up from Q4 worth it at 7B
+  # CPU ≥14GB RAM: qwen2.5-coder:7b Q5_K_M — Q5 step-up over Q4 worth it at 7B size
   [cpu_small_primary]="qwen2.5-coder:7b-instruct-q5_K_M"
   [cpu_small_primary_sz]=5
-  # Fallback: phi4-mini Q4_K_M — retains full 128K ctx (Q8/fp16 reduce to 4K)
+  # Fallback: phi4-mini Q4_K_M — retains full 128K ctx (Q8/fp16 variants drop to 4K)
   [fallback_primary]="phi4-mini:3.8b-q4_K_M"
   [fallback_primary_sz]=3
 )
@@ -353,13 +355,13 @@ _llm_pick_model() {
   ram_gb=$(awk '/^MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
 
   if (( vram_mb >= 30000 )); then
-    echo "${LLM_TAGS[gpu_large_primary]} ${LLM_TAGS[gpu_router]} GPU≥30GB→qwen3:32b+router"
+    echo "${LLM_TAGS[gpu_large_primary]} ${LLM_TAGS[gpu_router]} GPU≥30GB→qwen3-coder-next+router"
   elif (( vram_mb >= 22000 )); then
-    echo "${LLM_TAGS[gpu_mid_primary]} ${LLM_TAGS[gpu_router]} GPU≥22GB→qwen2.5-coder:32b+router"
+    echo "${LLM_TAGS[gpu_mid_primary]} ${LLM_TAGS[gpu_router]} GPU≥22GB→gemma4:31b-qat+router"
   elif (( vram_mb >= 10000 )); then
     echo "${LLM_TAGS[gpu_small_primary]} ${LLM_TAGS[gpu_router]} GPU≥10GB→gemma4:12b-qat+router"
   elif (( ram_gb >= 80 )); then
-    echo "${LLM_TAGS[cpu_large_primary]} none RAM≥80GB→gemma4:12b-qat"
+    echo "${LLM_TAGS[cpu_large_primary]} none RAM≥80GB→qwen3-coder-next-moe"
   elif (( ram_gb >= 48 )); then
     echo "${LLM_TAGS[cpu_mid_primary]} none RAM≥48GB→phi4:14b-q4_K_M"
   elif (( ram_gb >= 14 )); then
@@ -447,11 +449,22 @@ setup_local_llm() {
   echo "   Primary  : ${PRIMARY_MODEL} (${REASON})"
   [[ "${ROUTER_MODEL}" != "none" ]] && echo "   Router   : ${ROUTER_MODEL} (always-hot, handles QUICK queries)"
 
-  # Sizes for disk check
+  # Sizes for disk check — look up from registry first, fall back to param-count heuristic
   local p_sz r_sz=0
-  p_sz=$(echo "${PRIMARY_MODEL}" | grep -oP '\d+(?=b[-:]|b$)' | tail -1 || echo 10)
-  # Rough size estimate from param count if not in registry
-  (( p_sz > 30 )) && p_sz=20 || (( p_sz > 10 )) && p_sz=9 || p_sz=5
+  # Find which registry key matches the selected model, use its _sz entry
+  for key in gpu_large_primary gpu_mid_primary gpu_small_primary \
+             cpu_large_primary cpu_mid_primary cpu_small_primary fallback_primary; do
+    if [[ "${LLM_TAGS[${key}]}" == "${PRIMARY_MODEL}" ]]; then
+      p_sz="${LLM_TAGS[${key}_sz]}"
+      break
+    fi
+  done
+  # Fallback heuristic if model came from LOCAL_LLM_MODEL override
+  if [[ -z "${p_sz:-}" ]]; then
+    local param_b
+    param_b=$(echo "${PRIMARY_MODEL}" | grep -oP '\d+(?=b[-:]|b$)' | tail -1 || echo 10)
+    (( param_b > 70 )) && p_sz=52 || (( param_b > 30 )) && p_sz=20 || (( param_b > 10 )) && p_sz=9 || p_sz=5
+  fi
   [[ "${ROUTER_MODEL}" != "none" ]] && r_sz=5
 
   if ! _llm_check_disk "${p_sz}" "${r_sz}"; then
