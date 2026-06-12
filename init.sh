@@ -304,6 +304,82 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
 fi
 echo "✅  Claude Code installed. Test with: claude --version"
 
+# ── 6b. Local LLM (offline sysadmin assistant via Ollama) ─────
+# Runs entirely on the local GPU — no internet needed after setup.
+# Model is pulled now (while online) so it's cached for offline use.
+# Override model with: LOCAL_LLM_MODEL=llama3.3:70b bash init.sh
+LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-qwen2.5:14b}"
+
+setup_local_llm() {
+  echo "── Setting up local LLM (Ollama + ${LOCAL_LLM_MODEL}) ──"
+
+  # Install Ollama via its official installer (handles arch + GPU detection)
+  if ! command -v ollama &>/dev/null; then
+    echo "   Installing Ollama..."
+    curl -fsSL https://ollama.ai/install.sh | sh
+  else
+    echo "   Ollama already installed: $(ollama --version 2>/dev/null)"
+  fi
+
+  # Enable and start the Ollama service
+  sudo systemctl enable --now ollama 2>/dev/null || true
+
+  # Wait for the API to be ready (up to 30s)
+  local tries=0
+  until curl -sf http://localhost:11434/api/tags &>/dev/null || (( ++tries >= 30 )); do
+    sleep 1
+  done
+  if (( tries >= 30 )); then
+    echo "⚠️   Ollama API not responding — skipping model pull. Run: ollama pull ${LOCAL_LLM_MODEL}"
+    return 0
+  fi
+
+  # Pull the model (cached on disk — works offline after this)
+  if ollama list 2>/dev/null | grep -q "^${LOCAL_LLM_MODEL}"; then
+    echo "   Model ${LOCAL_LLM_MODEL} already present."
+  else
+    echo "   Pulling ${LOCAL_LLM_MODEL} (this downloads ~9 GB once, then works offline)..."
+    ollama pull "${LOCAL_LLM_MODEL}"
+  fi
+
+  # Install the 'ask' helper: `ask "how do I configure X"`
+  sudo mkdir -p /usr/local/bin
+  sudo tee /usr/local/bin/ask > /dev/null << 'ASKEOF'
+#!/usr/bin/env bash
+# ask — query the local LLM with a sysadmin system prompt
+# Usage: ask "how do I list open ports?"  or  echo "what is /etc/fstab?" | ask
+MODEL="${LOCAL_LLM_MODEL:-qwen2.5:14b}"
+SYSTEM="You are a concise Linux/Arch sysadmin assistant running locally on CachyOS. \
+Give direct, actionable answers. Prefer commands over explanations. \
+When showing commands, use code blocks. Never hallucinate package names."
+
+if [[ $# -gt 0 ]]; then
+  PROMPT="$*"
+elif [[ ! -t 0 ]]; then
+  PROMPT=$(cat)
+else
+  echo "Usage: ask \"question\"  or  echo \"question\" | ask" >&2; exit 1
+fi
+
+ollama run "${MODEL}" --system "${SYSTEM}" "${PROMPT}"
+ASKEOF
+  sudo chmod +x /usr/local/bin/ask
+
+  # Fish shell alias + model env var
+  mkdir -p ~/.config/fish/conf.d
+  cat > ~/.config/fish/conf.d/ollama.fish << FISHEOF
+set -gx LOCAL_LLM_MODEL "${LOCAL_LLM_MODEL}"
+# 'ask' is in /usr/local/bin — no alias needed, just a reminder:
+# ask "how do I configure a static IP with nmcli?"
+FISHEOF
+
+  echo "✅  Local LLM ready. Usage:"
+  echo "     ask \"how do I configure a static IP?\""
+  echo "     ask \"show me the nvidia-smi output format\""
+  echo "     journalctl -xe | ask   # pipe logs for analysis"
+}
+setup_local_llm
+
 # ── 7. Enable remaining services ──────────────────────────────
 echo "── Enabling services ──"
 if curl -fsSL "${DOTFILES}/services.txt" -o /tmp/services.txt 2>/dev/null; then
@@ -330,6 +406,7 @@ echo "  Tailscale   : $(tailscale ip -4 2>/dev/null || echo 'check: tailscale ip
 echo "  SSH user    : $(whoami)"
 echo "  WiFi (8812) : $(lsmod 2>/dev/null | grep -q '^8812au' && echo 'AWUS036ACH ready' || echo 'check: lsmod | grep 8812au')"
 echo "  GPU driver  : $(lsmod 2>/dev/null | grep -q '^nvidia ' && echo 'nvidia loaded' || (lsmod 2>/dev/null | grep -q '^amdgpu' && echo 'amdgpu loaded' || echo 'reboot to activate — driver installed'))"
+echo "  Local LLM   : $(ollama list 2>/dev/null | grep -q "${LOCAL_LLM_MODEL}" && echo "${LOCAL_LLM_MODEL} ready — try: ask \"hello\"" || echo 'check: ollama list')"
 echo "  Claude Code : $(claude --version 2>/dev/null || echo 'run: claude --version')"
 echo
 echo "  Continue from another device on your tailnet:"
