@@ -305,78 +305,210 @@ fi
 echo "✅  Claude Code installed. Test with: claude --version"
 
 # ── 6b. Local LLM (offline sysadmin assistant via Ollama) ─────
-# Runs entirely on the local GPU — no internet needed after setup.
-# Model is pulled now (while online) so it's cached for offline use.
-# Override model with: LOCAL_LLM_MODEL=llama3.3:70b bash init.sh
-LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-qwen2.5:14b}"
+# Decision tree: GPU VRAM → RAM → tiny fallback.
+# Router model (qwen2.5:7b) stays hot on GPU; specialist dispatched per query type.
+# Set LOCAL_LLM_MODEL in .env to override auto-detection.
+# Set SKIP_LLM=1 to skip entirely (e.g. first boot on a small disk).
+
+# Model sizes in GiB for disk/RAM checks (Q4_K_M quant)
+declare -A LLM_SIZES=(
+  [qwen2.5-coder:32b]=20 [qwen3:32b]=20 [qwen3:14b]=9
+  [deepseek-r1:14b]=9    [phi4:14b]=9   [qwen2.5-coder:7b]=5
+  [qwen2.5:7b]=5         [phi4-mini]=3  [qwen3:8b]=5
+)
+
+_llm_pick_model() {
+  # Returns: PRIMARY_MODEL  ROUTER_MODEL  REASON
+  local vram_mb=0 ram_gb=0 nvidia_vram=0
+
+  # — NVIDIA VRAM (MiB) —
+  if command -v nvidia-smi &>/dev/null; then
+    nvidia_vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+                  2>/dev/null | head -1 | tr -d ' ')
+    vram_mb="${nvidia_vram:-0}"
+  fi
+
+  # — System RAM (GiB) —
+  ram_gb=$(awk '/^MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+
+  if (( vram_mb >= 30000 )); then
+    echo "qwen3:32b qwen2.5:7b GPU≥30GB→qwen3:32b+router"
+  elif (( vram_mb >= 22000 )); then
+    echo "qwen2.5-coder:32b qwen2.5:7b GPU≥22GB→qwen2.5-coder:32b+router"
+  elif (( vram_mb >= 10000 )); then
+    echo "qwen3:14b qwen2.5:7b GPU≥10GB→qwen3:14b+router"
+  elif (( ram_gb >= 80 )); then
+    echo "deepseek-r1:14b none RAM≥80GB→deepseek-r1:14b"
+  elif (( ram_gb >= 48 )); then
+    echo "phi4:14b none RAM≥48GB→phi4:14b"
+  elif (( ram_gb >= 14 )); then
+    echo "qwen2.5-coder:7b none RAM≥14GB→qwen2.5-coder:7b"
+  else
+    echo "phi4-mini none RAM<14GB→phi4-mini(tiny)"
+  fi
+}
+
+_llm_check_disk() {
+  local model="$1" router="$2"
+  local needed=0 free_gb
+  needed=$(( ${LLM_SIZES[$model]:-10} + ${LLM_SIZES[$router]:-0} + 10 ))
+  free_gb=$(df -BG "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}" 2>/dev/null \
+            | awk 'NR==2{gsub(/G/,"",$4); print $4}' || \
+            df -BG /var 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || echo 0)
+  if (( free_gb < needed )); then
+    echo "⚠️   Disk space: need ~${needed}GB free for models, have ${free_gb}GB."
+    echo "   Options:"
+    echo "     1. Plug in a larger drive and set OLLAMA_MODELS=/mnt/yourdrive/.ollama/models"
+    echo "     2. Use a smaller model: SKIP_LLM=1 to skip, or LOCAL_LLM_MODEL=phi4-mini"
+    echo "     3. export OLLAMA_MODELS=/path/to/big/drive && re-run init.sh"
+    return 1
+  fi
+  return 0
+}
 
 setup_local_llm() {
-  echo "── Setting up local LLM (Ollama + ${LOCAL_LLM_MODEL}) ──"
+  if [[ -n "${SKIP_LLM:-}" ]]; then
+    echo "── Local LLM skipped (SKIP_LLM set) ──"
+    return 0
+  fi
+  echo "── Setting up local LLM (Ollama) ──"
 
-  # Install Ollama via its official installer (handles arch + GPU detection)
+  # Auto-select model unless overridden
+  local selection PRIMARY_MODEL ROUTER_MODEL REASON
+  if [[ -n "${LOCAL_LLM_MODEL:-}" ]]; then
+    PRIMARY_MODEL="${LOCAL_LLM_MODEL}"
+    ROUTER_MODEL="${LOCAL_LLM_ROUTER:-none}"
+    REASON="override from .env"
+  else
+    read -r PRIMARY_MODEL ROUTER_MODEL REASON <<< "$(_llm_pick_model)"
+  fi
+  echo "   Selected: ${PRIMARY_MODEL} (${REASON})"
+  [[ "${ROUTER_MODEL}" != "none" ]] && echo "   Router:   ${ROUTER_MODEL} (always-hot classifier)"
+
+  # Disk space check — bail out gracefully rather than fail mid-pull
+  local router_for_check="${ROUTER_MODEL}"
+  [[ "${router_for_check}" == "none" ]] && router_for_check=""
+  if ! _llm_check_disk "${PRIMARY_MODEL}" "${router_for_check:-}"; then
+    echo "   Skipping model pull — fix disk space and re-run, or set SKIP_LLM=1."
+    return 0
+  fi
+
+  # Install Ollama
   if ! command -v ollama &>/dev/null; then
     echo "   Installing Ollama..."
     curl -fsSL https://ollama.ai/install.sh | sh
   else
-    echo "   Ollama already installed: $(ollama --version 2>/dev/null)"
+    echo "   Ollama $(ollama --version 2>/dev/null) already installed."
   fi
 
-  # Enable and start the Ollama service
+  # Configure Ollama: keep up to 3 models loaded, extend keep-alive for offline use
+  sudo mkdir -p /etc/systemd/system/ollama.service.d
+  sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
+[Service]
+Environment="OLLAMA_MAX_LOADED_MODELS=3"
+Environment="OLLAMA_KEEP_ALIVE=60m"
+Environment="OLLAMA_NUM_PARALLEL=2"
+EOF
+  sudo systemctl daemon-reload
   sudo systemctl enable --now ollama 2>/dev/null || true
 
-  # Wait for the API to be ready (up to 30s)
+  # Wait for API (up to 30s)
   local tries=0
   until curl -sf http://localhost:11434/api/tags &>/dev/null || (( ++tries >= 30 )); do
     sleep 1
   done
   if (( tries >= 30 )); then
-    echo "⚠️   Ollama API not responding — skipping model pull. Run: ollama pull ${LOCAL_LLM_MODEL}"
+    echo "⚠️   Ollama API not responding — run: ollama pull ${PRIMARY_MODEL}"
     return 0
   fi
 
-  # Pull the model (cached on disk — works offline after this)
-  if ollama list 2>/dev/null | grep -q "^${LOCAL_LLM_MODEL}"; then
-    echo "   Model ${LOCAL_LLM_MODEL} already present."
-  else
-    echo "   Pulling ${LOCAL_LLM_MODEL} (this downloads ~9 GB once, then works offline)..."
-    ollama pull "${LOCAL_LLM_MODEL}"
-  fi
+  # Pull models
+  _llm_pull() {
+    local m="$1"
+    if ollama list 2>/dev/null | grep -q "^${m}"; then
+      echo "   ${m}: already present."
+    else
+      local sz="${LLM_SIZES[$m]:-?}"
+      echo "   Pulling ${m} (~${sz}GB — cached forever after this)..."
+      ollama pull "${m}"
+    fi
+  }
+  _llm_pull "${PRIMARY_MODEL}"
+  [[ "${ROUTER_MODEL}" != "none" ]] && _llm_pull "${ROUTER_MODEL}"
 
-  # Install the 'ask' helper: `ask "how do I configure X"`
+  # Write /usr/local/bin/ask with smart dispatch
   sudo mkdir -p /usr/local/bin
-  sudo tee /usr/local/bin/ask > /dev/null << 'ASKEOF'
+  # Export vars so the heredoc can see them
+  local _primary="${PRIMARY_MODEL}" _router="${ROUTER_MODEL}"
+  sudo tee /usr/local/bin/ask > /dev/null << ASKEOF
 #!/usr/bin/env bash
-# ask — query the local LLM with a sysadmin system prompt
-# Usage: ask "how do I list open ports?"  or  echo "what is /etc/fstab?" | ask
-MODEL="${LOCAL_LLM_MODEL:-qwen2.5:14b}"
-SYSTEM="You are a concise Linux/Arch sysadmin assistant running locally on CachyOS. \
-Give direct, actionable answers. Prefer commands over explanations. \
-When showing commands, use code blocks. Never hallucinate package names."
+# ask — offline sysadmin LLM assistant
+# Usage:  ask "how do I configure X"
+#         journalctl -xe | ask
+#         ask --model qwen3:14b "question"   # force a specific model
 
-if [[ $# -gt 0 ]]; then
-  PROMPT="$*"
+PRIMARY="${_primary}"
+ROUTER="${_router}"
+SYSTEM="You are a concise Linux/Arch/CachyOS sysadmin assistant. \
+Give direct, actionable answers. Prefer commands over explanations. \
+Use code blocks for commands. Never invent package names — only use packages \
+that exist in the Arch/CachyOS repos or AUR."
+
+# Parse --model override
+MODEL=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    --model|-m) MODEL="\$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+if [[ \$# -gt 0 ]]; then
+  PROMPT="\$*"
 elif [[ ! -t 0 ]]; then
-  PROMPT=$(cat)
+  PROMPT=\$(cat)
 else
   echo "Usage: ask \"question\"  or  echo \"question\" | ask" >&2; exit 1
 fi
 
-ollama run "${MODEL}" --system "${SYSTEM}" "${PROMPT}"
+# Smart dispatch: classify with router if available, else use primary
+if [[ -z "\${MODEL}" && "\${ROUTER}" != "none" && -n "\${ROUTER}" ]]; then
+  CATEGORY=\$(ollama run "\${ROUTER}" \
+    --system "Classify the query into ONE word: QUICK, CODE, or DEBUG. Reply with only that word." \
+    "\${PROMPT}" 2>/dev/null | tr -d '[:space:]' | head -c 10)
+  case "\${CATEGORY^^}" in
+    QUICK) MODEL="\${ROUTER}" ;;   # fast model handles simple lookups
+    *)     MODEL="\${PRIMARY}" ;;  # CODE and DEBUG go to the specialist
+  esac
+else
+  MODEL="\${MODEL:-\${PRIMARY}}"
+fi
+
+ollama run "\${MODEL}" --system "\${SYSTEM}" "\${PROMPT}"
 ASKEOF
   sudo chmod +x /usr/local/bin/ask
 
-  # Fish shell alias + model env var
+  # Persist env for fish and bash
   mkdir -p ~/.config/fish/conf.d
   cat > ~/.config/fish/conf.d/ollama.fish << FISHEOF
-set -gx LOCAL_LLM_MODEL "${LOCAL_LLM_MODEL}"
-# 'ask' is in /usr/local/bin — no alias needed, just a reminder:
-# ask "how do I configure a static IP with nmcli?"
+set -gx LOCAL_LLM_MODEL "${PRIMARY_MODEL}"
+set -gx LOCAL_LLM_ROUTER "${ROUTER_MODEL}"
+# Offline sysadmin assistant:
+#   ask "how do I configure a static IP with nmcli?"
+#   journalctl -xe | ask
+#   dmesg | ask "any GPU errors here?"
+#   ask --model ${PRIMARY_MODEL} "complex question"
 FISHEOF
+  grep -q 'LOCAL_LLM_MODEL' ~/.bashrc 2>/dev/null || \
+    echo "export LOCAL_LLM_MODEL='${PRIMARY_MODEL}'" >> ~/.bashrc
 
-  echo "✅  Local LLM ready. Usage:"
-  echo "     ask \"how do I configure a static IP?\""
-  echo "     ask \"show me the nvidia-smi output format\""
-  echo "     journalctl -xe | ask   # pipe logs for analysis"
+  echo "✅  Local LLM ready."
+  echo "     Primary model : ${PRIMARY_MODEL}"
+  [[ "${ROUTER_MODEL}" != "none" ]] && \
+    echo "     Router model  : ${ROUTER_MODEL} (handles QUICK queries fast)"
+  echo "     Usage: ask \"how do I configure X\""
+  echo "            journalctl -xe | ask"
+  echo "            dmesg | ask \"any GPU errors?\""
 }
 setup_local_llm
 
@@ -406,7 +538,7 @@ echo "  Tailscale   : $(tailscale ip -4 2>/dev/null || echo 'check: tailscale ip
 echo "  SSH user    : $(whoami)"
 echo "  WiFi (8812) : $(lsmod 2>/dev/null | grep -q '^8812au' && echo 'AWUS036ACH ready' || echo 'check: lsmod | grep 8812au')"
 echo "  GPU driver  : $(lsmod 2>/dev/null | grep -q '^nvidia ' && echo 'nvidia loaded' || (lsmod 2>/dev/null | grep -q '^amdgpu' && echo 'amdgpu loaded' || echo 'reboot to activate — driver installed'))"
-echo "  Local LLM   : $(ollama list 2>/dev/null | grep -q "${LOCAL_LLM_MODEL}" && echo "${LOCAL_LLM_MODEL} ready — try: ask \"hello\"" || echo 'check: ollama list')"
+echo "  Local LLM   : $(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -1 | grep -q . && echo "$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | paste -sd, -) — try: ask \"hello\"" || echo 'check: ollama list')"
 echo "  Claude Code : $(claude --version 2>/dev/null || echo 'run: claude --version')"
 echo
 echo "  Continue from another device on your tailnet:"
