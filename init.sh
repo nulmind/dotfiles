@@ -11,6 +11,7 @@
 # Idempotent: safe to re-run. Fail-fast: a failed step stops the script.
 
 set -euo pipefail
+trap 'echo "❌  init.sh failed at line ${LINENO} — command: ${BASH_COMMAND}" >&2' ERR
 
 DOTFILES="${DOTFILES:-https://raw.githubusercontent.com/nulmind/dotfiles/main}"
 
@@ -168,6 +169,105 @@ setup_awus036ach() {
 }
 setup_awus036ach
 
+# ── 3c. GPU driver ─────────────────────────────────────────────
+setup_gpu() {
+  echo "── Setting up GPU driver ──"
+
+  # Detect vendor from lspci PCI class 0300/0302 (VGA / 3D controller)
+  local GPU_LINE VENDOR_ID
+  GPU_LINE=$(lspci -nn 2>/dev/null \
+    | grep -iE '\[03(00|01|02)\]' | head -1)
+  if [[ -z "${GPU_LINE}" ]]; then
+    echo "   (No discrete GPU detected — skipping.)"
+    return 0
+  fi
+  echo "   Detected: ${GPU_LINE}"
+
+  # Extract 4-digit vendor ID from the [vvvv:dddd] suffix
+  VENDOR_ID=$(echo "${GPU_LINE}" | grep -oP '\[\K[0-9a-fA-F]{4}(?=:[0-9a-fA-F]{4}\])' | head -1)
+
+  case "${VENDOR_ID,,}" in
+    10de)  _setup_nvidia ;;
+    1002)  _setup_amd    ;;
+    8086)  _setup_intel  ;;
+    *)     echo "   ⚠️   Unknown GPU vendor ${VENDOR_ID} — skipping auto-setup." ;;
+  esac
+}
+
+_setup_nvidia() {
+  echo "   Vendor: NVIDIA — installing proprietary driver stack"
+
+  # CachyOS ships nvidia-dkms in its repos; prefer it over the AUR.
+  pac dkms
+  sudo pacman -S --noconfirm --needed linux-cachyos-headers 2>/dev/null \
+    || sudo pacman -S --noconfirm --needed linux-headers 2>/dev/null || true
+
+  # Core driver + userspace
+  pac nvidia-dkms nvidia-utils nvidia-settings lib32-nvidia-utils
+
+  # Vulkan + VA-API via NVDEC (optional but useful for Blender/ML workloads)
+  pac vulkan-icd-loader lib32-vulkan-icd-loader
+
+  # Blacklist nouveau so it doesn't race the proprietary driver at boot
+  if [[ ! -f /etc/modprobe.d/blacklist-nouveau.conf ]]; then
+    echo -e "blacklist nouveau\noptions nouveau modeset=0" \
+      | sudo tee /etc/modprobe.d/blacklist-nouveau.conf > /dev/null
+    echo "   Blacklisted nouveau."
+  fi
+
+  # Add nvidia to the mkinitcpio MODULES array so the driver loads in initramfs
+  # (needed for early KMS / framebuffer on Wayland)
+  if ! grep -q 'nvidia' /etc/mkinitcpio.conf 2>/dev/null; then
+    sudo sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' \
+      /etc/mkinitcpio.conf
+    sudo mkinitcpio -P 2>/dev/null || true
+    echo "   Updated mkinitcpio MODULES."
+  fi
+
+  # Enable DRM kernel mode-setting (required for Wayland + suspend/resume)
+  local CMDLINE=/etc/kernel/cmdline
+  if [[ -f "${CMDLINE}" ]] && ! grep -q 'nvidia-drm.modeset' "${CMDLINE}"; then
+    sudo sed -i 's/$/ nvidia-drm.modeset=1/' "${CMDLINE}"
+    echo "   Added nvidia-drm.modeset=1 to kernel cmdline."
+  fi
+
+  # Persist nvidia power management
+  pac nvidia-prime 2>/dev/null || true
+  sudo systemctl enable nvidia-persistenced 2>/dev/null || true
+
+  # Check driver loaded (won't be until reboot when running from live ISO)
+  if lsmod 2>/dev/null | grep -q '^nvidia '; then
+    echo "✅  NVIDIA driver loaded."
+  else
+    echo "⚠️   NVIDIA driver installed — will activate on next boot (expected on live ISO)."
+  fi
+
+  # CUDA toolkit (large — skip unless CUDA env var is set)
+  if [[ -n "${INSTALL_CUDA:-}" ]]; then
+    echo "   Installing CUDA toolkit (this is large)..."
+    pac cuda cudnn
+  else
+    echo "   Tip: re-run with INSTALL_CUDA=1 to also install the CUDA toolkit."
+  fi
+}
+
+_setup_amd() {
+  echo "   Vendor: AMD — installing open-source Mesa stack"
+  pac mesa lib32-mesa vulkan-radeon lib32-vulkan-radeon libva-mesa-driver
+  echo "✅  AMD Mesa driver installed."
+}
+
+_setup_intel() {
+  echo "   Vendor: Intel — installing Mesa + intel-media-driver"
+  pac mesa lib32-mesa vulkan-intel lib32-vulkan-intel intel-media-driver
+  echo "✅  Intel GPU driver installed."
+}
+
+setup_gpu
+
+# Free pacman cache after heavy DKMS + GPU installs to avoid tmpfs pressure
+sudo pacman -Scc --noconfirm 2>/dev/null || true
+
 # ── 4. SSH server (enables remote shell access) ────────────────
 echo "── Enabling SSH ──"
 pac openssh
@@ -229,6 +329,7 @@ echo "  Local IP    : $(hostname -I 2>/dev/null | awk '{print $1}')"
 echo "  Tailscale   : $(tailscale ip -4 2>/dev/null || echo 'check: tailscale ip')"
 echo "  SSH user    : $(whoami)"
 echo "  WiFi (8812) : $(lsmod 2>/dev/null | grep -q '^8812au' && echo 'AWUS036ACH ready' || echo 'check: lsmod | grep 8812au')"
+echo "  GPU driver  : $(lsmod 2>/dev/null | grep -q '^nvidia ' && echo 'nvidia loaded' || (lsmod 2>/dev/null | grep -q '^amdgpu' && echo 'amdgpu loaded' || echo 'reboot to activate — driver installed'))"
 echo "  Claude Code : $(claude --version 2>/dev/null || echo 'run: claude --version')"
 echo
 echo "  Continue from another device on your tailnet:"
