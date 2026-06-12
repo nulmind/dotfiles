@@ -305,76 +305,131 @@ fi
 echo "✅  Claude Code installed. Test with: claude --version"
 
 # ── 6b. Local LLM (offline sysadmin assistant via Ollama) ─────
-# Decision tree: GPU VRAM → RAM → tiny fallback.
-# Router model (qwen2.5:7b) stays hot on GPU; specialist dispatched per query type.
-# Set LOCAL_LLM_MODEL in .env to override auto-detection.
-# Set SKIP_LLM=1 to skip entirely (e.g. first boot on a small disk).
+# Decision tree: GPU VRAM → CPU RAM → tiny fallback.
+# Exact quant tags chosen per hardware for best quality/VRAM balance.
+# GPU path: router (qwen2.5:7b-q4_K_M) stays always-hot; specialist dispatched per query.
+# Set LOCAL_LLM_MODEL / LOCAL_LLM_ROUTER in .env to override.
+# Set SKIP_LLM=1 to skip entirely (pull models later when disk is ready).
 
-# Model sizes in GiB for disk/RAM checks (Q4_K_M quant)
-declare -A LLM_SIZES=(
-  [qwen2.5-coder:32b]=20 [qwen3:32b]=20 [qwen3:14b]=9
-  [deepseek-r1:14b]=9    [phi4:14b]=9   [qwen2.5-coder:7b]=5
-  [qwen2.5:7b]=5         [phi4-mini]=3  [qwen3:8b]=5
+# ── Model registry: tag → download size in GiB ─────────────────
+declare -A LLM_TAGS=(
+  # GPU ≥30GB (RTX 5090): qwen3:32b — best tool-use + hybrid thinking mode; 34 tok/s on RTX 4090
+  # Qwen3-Coder-Next 80B (58.7% SWE-bench) needs 48GB VRAM+RAM — too large for single GPU
+  [gpu_large_primary]="qwen3:32b-q4_K_M"
+  [gpu_large_primary_sz]=20
+  # GPU ≥22GB (RTX 3090): qwen2.5-coder:32b — best raw coding benchmark (HumanEval 92.7%)
+  [gpu_mid_primary]="qwen2.5-coder:32b-instruct-q4_K_M"
+  [gpu_mid_primary_sz]=20
+  # GPU ≥10GB: gemma4:12b-it-qat — QAT beats standard Q4_K_M at ~7GB; multimodal, 256K ctx
+  # QAT (Quantization-Aware Training) bakes compression into training; ~72% mem reduction, near-original quality
+  [gpu_small_primary]="gemma4:12b-it-qat"
+  [gpu_small_primary_sz]=7
+  # GPU router: always-hot classifier, tiny footprint
+  [gpu_router]="qwen2.5:7b-instruct-q4_K_M"
+  [gpu_router_sz]=5
+  # CPU ≥80GB RAM: gemma4:12b-it-qat — 7GB vs 16GB for deepseek q8, faster inference, QAT quality
+  [cpu_large_primary]="gemma4:12b-it-qat"
+  [cpu_large_primary_sz]=7
+  # CPU ≥48GB RAM: phi4 Q4_K_M — best reasoning/math at 14B on CPU
+  [cpu_mid_primary]="phi4:14b-q4_K_M"
+  [cpu_mid_primary_sz]=9
+  # CPU ≥14GB RAM: qwen2.5-coder Q5_K_M — step up from Q4 worth it at 7B
+  [cpu_small_primary]="qwen2.5-coder:7b-instruct-q5_K_M"
+  [cpu_small_primary_sz]=5
+  # Fallback: phi4-mini Q4_K_M — retains full 128K ctx (Q8/fp16 reduce to 4K)
+  [fallback_primary]="phi4-mini:3.8b-q4_K_M"
+  [fallback_primary_sz]=3
 )
 
 _llm_pick_model() {
-  # Returns: PRIMARY_MODEL  ROUTER_MODEL  REASON
-  local vram_mb=0 ram_gb=0 nvidia_vram=0
+  # Returns: PRIMARY_TAG  ROUTER_TAG  REASON
+  local vram_mb=0 ram_gb=0
 
-  # — NVIDIA VRAM (MiB) —
   if command -v nvidia-smi &>/dev/null; then
-    nvidia_vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
-                  2>/dev/null | head -1 | tr -d ' ')
-    vram_mb="${nvidia_vram:-0}"
+    vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+              2>/dev/null | head -1 | tr -d ' ')
+    vram_mb="${vram_mb:-0}"
   fi
-
-  # — System RAM (GiB) —
   ram_gb=$(awk '/^MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
 
   if (( vram_mb >= 30000 )); then
-    echo "qwen3:32b qwen2.5:7b GPU≥30GB→qwen3:32b+router"
+    echo "${LLM_TAGS[gpu_large_primary]} ${LLM_TAGS[gpu_router]} GPU≥30GB→qwen3:32b+router"
   elif (( vram_mb >= 22000 )); then
-    echo "qwen2.5-coder:32b qwen2.5:7b GPU≥22GB→qwen2.5-coder:32b+router"
+    echo "${LLM_TAGS[gpu_mid_primary]} ${LLM_TAGS[gpu_router]} GPU≥22GB→qwen2.5-coder:32b+router"
   elif (( vram_mb >= 10000 )); then
-    echo "qwen3:14b qwen2.5:7b GPU≥10GB→qwen3:14b+router"
+    echo "${LLM_TAGS[gpu_small_primary]} ${LLM_TAGS[gpu_router]} GPU≥10GB→gemma4:12b-qat+router"
   elif (( ram_gb >= 80 )); then
-    echo "deepseek-r1:14b none RAM≥80GB→deepseek-r1:14b"
+    echo "${LLM_TAGS[cpu_large_primary]} none RAM≥80GB→gemma4:12b-qat"
   elif (( ram_gb >= 48 )); then
-    echo "phi4:14b none RAM≥48GB→phi4:14b"
+    echo "${LLM_TAGS[cpu_mid_primary]} none RAM≥48GB→phi4:14b-q4_K_M"
   elif (( ram_gb >= 14 )); then
-    echo "qwen2.5-coder:7b none RAM≥14GB→qwen2.5-coder:7b"
+    echo "${LLM_TAGS[cpu_small_primary]} none RAM≥14GB→qwen2.5-coder:7b-q5_K_M"
   else
-    echo "phi4-mini none RAM<14GB→phi4-mini(tiny)"
+    echo "${LLM_TAGS[fallback_primary]} none fallback→phi4-mini:3.8b-q4_K_M"
   fi
 }
 
 _llm_check_disk() {
-  local model="$1" router="$2"
-  local needed=0 free_gb
-  needed=$(( ${LLM_SIZES[$model]:-10} + ${LLM_SIZES[$router]:-0} + 10 ))
-  free_gb=$(df -BG "${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}" 2>/dev/null \
-            | awk 'NR==2{gsub(/G/,"",$4); print $4}' || \
-            df -BG /var 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || echo 0)
+  local primary_sz="$1" router_sz="$2"
+  local needed=$(( primary_sz + router_sz + 10 )) free_gb
+  local models_path="${OLLAMA_MODELS:-/usr/share/ollama/.ollama/models}"
+  # Fall back to checking /var if models path doesn't exist yet
+  free_gb=$(df -BG "${models_path}" 2>/dev/null \
+            | awk 'NR==2{gsub(/G/,"",$4); print $4}') \
+    || free_gb=$(df -BG /var 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}') \
+    || free_gb=0
   if (( free_gb < needed )); then
-    echo "⚠️   Disk space: need ~${needed}GB free for models, have ${free_gb}GB."
-    echo "   Options:"
-    echo "     1. Plug in a larger drive and set OLLAMA_MODELS=/mnt/yourdrive/.ollama/models"
-    echo "     2. Use a smaller model: SKIP_LLM=1 to skip, or LOCAL_LLM_MODEL=phi4-mini"
-    echo "     3. export OLLAMA_MODELS=/path/to/big/drive && re-run init.sh"
+    echo "⚠️   Disk space: need ~${needed}GB free for models, only ${free_gb}GB available."
+    echo "   To fix:"
+    echo "     • Plug in a larger drive and add to .env:"
+    echo "         OLLAMA_MODELS=/mnt/bigdrive/.ollama/models"
+    echo "     • Or use a smaller model: LOCAL_LLM_MODEL=phi4-mini:3.8b-q4_K_M"
+    echo "     • Or skip for now: SKIP_LLM=1 (pull models manually later)"
     return 1
   fi
   return 0
 }
 
+_llm_write_modelfile() {
+  # Create an Ollama Modelfile tuned for the detected hardware scenario
+  local tag="$1" is_gpu="$2" is_router="$3"
+  local mfile="/tmp/ollama-modelfile-$(echo "${tag}" | tr ':/' '--')"
+  local num_ctx=8192 temp=0.3 gpu_layers=99 num_thread=0
+
+  # Context window: GPU has VRAM headroom with KV quant; CPU keep smaller
+  [[ "${is_gpu}" == "1" ]] && num_ctx=8192 || num_ctx=4096
+  # Router uses tiny context — it only classifies short queries
+  [[ "${is_router}" == "1" ]] && num_ctx=2048 && temp=0.1
+  # Thread count: physical cores only (hyperthreads hurt LLM inference)
+  num_thread=$(nproc --all 2>/dev/null || echo 8)
+  local phys_cores
+  phys_cores=$(lscpu 2>/dev/null | awk '/^Core\(s\) per socket/{c=$NF} /^Socket\(s\)/{s=$NF} END{print c*s}')
+  [[ -n "${phys_cores}" && "${phys_cores}" -gt 0 ]] && num_thread="${phys_cores}"
+
+  {
+    echo "FROM ${tag}"
+    echo "PARAMETER num_ctx ${num_ctx}"
+    echo "PARAMETER num_predict -1"
+    echo "PARAMETER temperature ${temp}"
+    echo "PARAMETER repeat_penalty 1.05"
+    if [[ "${is_gpu}" == "1" ]]; then
+      echo "PARAMETER num_gpu ${gpu_layers}"
+    else
+      echo "PARAMETER num_gpu 0"
+      echo "PARAMETER num_thread ${num_thread}"
+    fi
+  } > "${mfile}"
+  echo "${mfile}"
+}
+
 setup_local_llm() {
   if [[ -n "${SKIP_LLM:-}" ]]; then
-    echo "── Local LLM skipped (SKIP_LLM set) ──"
-    return 0
+    echo "── Local LLM skipped (SKIP_LLM set) ──"; return 0
   fi
   echo "── Setting up local LLM (Ollama) ──"
 
-  # Auto-select model unless overridden
-  local selection PRIMARY_MODEL ROUTER_MODEL REASON
+  # Detect hardware scenario
+  local PRIMARY_MODEL ROUTER_MODEL REASON IS_GPU=0
   if [[ -n "${LOCAL_LLM_MODEL:-}" ]]; then
     PRIMARY_MODEL="${LOCAL_LLM_MODEL}"
     ROUTER_MODEL="${LOCAL_LLM_ROUTER:-none}"
@@ -382,14 +437,25 @@ setup_local_llm() {
   else
     read -r PRIMARY_MODEL ROUTER_MODEL REASON <<< "$(_llm_pick_model)"
   fi
-  echo "   Selected: ${PRIMARY_MODEL} (${REASON})"
-  [[ "${ROUTER_MODEL}" != "none" ]] && echo "   Router:   ${ROUTER_MODEL} (always-hot classifier)"
+  [[ "${PRIMARY_MODEL}" == *"q4_K_M"* || "${PRIMARY_MODEL}" == *"q5_K_M"* \
+     || "${PRIMARY_MODEL}" == *"q8_0"* ]] || true  # tag always has quant suffix now
+  command -v nvidia-smi &>/dev/null && (( $(nvidia-smi --query-gpu=memory.total \
+    --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ') > 8000 )) \
+    && IS_GPU=1 || true
 
-  # Disk space check — bail out gracefully rather than fail mid-pull
-  local router_for_check="${ROUTER_MODEL}"
-  [[ "${router_for_check}" == "none" ]] && router_for_check=""
-  if ! _llm_check_disk "${PRIMARY_MODEL}" "${router_for_check:-}"; then
-    echo "   Skipping model pull — fix disk space and re-run, or set SKIP_LLM=1."
+  echo "   Hardware : $(command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "CPU-only ($(awk '/^MemTotal/{printf "%dGB", $2/1024/1024}' /proc/meminfo))")"
+  echo "   Primary  : ${PRIMARY_MODEL} (${REASON})"
+  [[ "${ROUTER_MODEL}" != "none" ]] && echo "   Router   : ${ROUTER_MODEL} (always-hot, handles QUICK queries)"
+
+  # Sizes for disk check
+  local p_sz r_sz=0
+  p_sz=$(echo "${PRIMARY_MODEL}" | grep -oP '\d+(?=b[-:]|b$)' | tail -1 || echo 10)
+  # Rough size estimate from param count if not in registry
+  (( p_sz > 30 )) && p_sz=20 || (( p_sz > 10 )) && p_sz=9 || p_sz=5
+  [[ "${ROUTER_MODEL}" != "none" ]] && r_sz=5
+
+  if ! _llm_check_disk "${p_sz}" "${r_sz}"; then
+    echo "   Skipping — fix disk space and re-run, or set SKIP_LLM=1."
     return 0
   fi
 
@@ -401,60 +467,90 @@ setup_local_llm() {
     echo "   Ollama $(ollama --version 2>/dev/null) already installed."
   fi
 
-  # Configure Ollama: keep up to 3 models loaded, extend keep-alive for offline use
+  # Ollama systemd config: Flash Attention + KV cache quant on NVIDIA,
+  # correct parallelism for CPU-only
   sudo mkdir -p /etc/systemd/system/ollama.service.d
-  sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
+  if [[ "${IS_GPU}" == "1" ]]; then
+    sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
 [Service]
+Environment="OLLAMA_FLASH_ATTENTION=1"
+Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
 Environment="OLLAMA_MAX_LOADED_MODELS=3"
 Environment="OLLAMA_KEEP_ALIVE=60m"
 Environment="OLLAMA_NUM_PARALLEL=2"
 EOF
+  else
+    sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << 'EOF'
+[Service]
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_KEEP_ALIVE=30m"
+Environment="OLLAMA_NUM_PARALLEL=1"
+EOF
+  fi
   sudo systemctl daemon-reload
   sudo systemctl enable --now ollama 2>/dev/null || true
 
-  # Wait for API (up to 30s)
+  # Wait for API
   local tries=0
   until curl -sf http://localhost:11434/api/tags &>/dev/null || (( ++tries >= 30 )); do
     sleep 1
   done
   if (( tries >= 30 )); then
-    echo "⚠️   Ollama API not responding — run: ollama pull ${PRIMARY_MODEL}"
+    echo "⚠️   Ollama API not responding — run manually: ollama pull ${PRIMARY_MODEL}"
     return 0
   fi
 
-  # Pull models
-  _llm_pull() {
-    local m="$1"
-    if ollama list 2>/dev/null | grep -q "^${m}"; then
-      echo "   ${m}: already present."
+  # Pull and register models with tuned Modelfiles
+  _llm_pull_and_create() {
+    local tag="$1" is_router="${2:-0}"
+    local short_name="${tag%%:*}"
+    local create_name="${tag//:/-}"   # ollama create name (no colons)
+
+    if ollama list 2>/dev/null | grep -qF "${tag}"; then
+      echo "   ${tag}: already present."
     else
-      local sz="${LLM_SIZES[$m]:-?}"
-      echo "   Pulling ${m} (~${sz}GB — cached forever after this)..."
-      ollama pull "${m}"
+      echo "   Pulling ${tag}..."
+      ollama pull "${tag}"
     fi
+
+    # Create a named model with tuned parameters
+    local mfile
+    mfile=$(_llm_write_modelfile "${tag}" "${IS_GPU}" "${is_router}")
+    ollama create "${create_name}-tuned" -f "${mfile}" &>/dev/null || true
   }
-  _llm_pull "${PRIMARY_MODEL}"
-  [[ "${ROUTER_MODEL}" != "none" ]] && _llm_pull "${ROUTER_MODEL}"
+
+  _llm_pull_and_create "${PRIMARY_MODEL}" 0
+  [[ "${ROUTER_MODEL}" != "none" ]] && _llm_pull_and_create "${ROUTER_MODEL}" 1
+
+  # Keep router always-hot: set its keep-alive to indefinite via API
+  if [[ "${ROUTER_MODEL}" != "none" ]]; then
+    local router_create_name="${ROUTER_MODEL//:/-}-tuned"
+    curl -sf http://localhost:11434/api/generate \
+      -d "{\"model\":\"${router_create_name}\",\"keep_alive\":-1,\"prompt\":\"hi\"}" \
+      &>/dev/null || true
+  fi
 
   # Write /usr/local/bin/ask with smart dispatch
   sudo mkdir -p /usr/local/bin
-  # Export vars so the heredoc can see them
   local _primary="${PRIMARY_MODEL}" _router="${ROUTER_MODEL}"
+  local _primary_tuned="${PRIMARY_MODEL//:/-}-tuned"
+  local _router_tuned="${ROUTER_MODEL//:/-}-tuned"
+
   sudo tee /usr/local/bin/ask > /dev/null << ASKEOF
 #!/usr/bin/env bash
-# ask — offline sysadmin LLM assistant
+# ask — offline sysadmin LLM assistant (auto-dispatches to best local model)
 # Usage:  ask "how do I configure X"
 #         journalctl -xe | ask
-#         ask --model qwen3:14b "question"   # force a specific model
+#         dmesg | ask "any GPU errors?"
+#         ask --model <name> "question"
 
-PRIMARY="${_primary}"
-ROUTER="${_router}"
+PRIMARY="${_primary_tuned}"
+ROUTER="${_router_tuned}"
 SYSTEM="You are a concise Linux/Arch/CachyOS sysadmin assistant. \
 Give direct, actionable answers. Prefer commands over explanations. \
 Use code blocks for commands. Never invent package names — only use packages \
 that exist in the Arch/CachyOS repos or AUR."
 
-# Parse --model override
 MODEL=""
 while [[ \$# -gt 0 ]]; do
   case "\$1" in
@@ -468,17 +564,16 @@ if [[ \$# -gt 0 ]]; then
 elif [[ ! -t 0 ]]; then
   PROMPT=\$(cat)
 else
-  echo "Usage: ask \"question\"  or  echo \"question\" | ask" >&2; exit 1
+  echo "Usage: ask \"question\"  or  command | ask" >&2; exit 1
 fi
 
-# Smart dispatch: classify with router if available, else use primary
-if [[ -z "\${MODEL}" && "\${ROUTER}" != "none" && -n "\${ROUTER}" ]]; then
+if [[ -z "\${MODEL}" && "\${ROUTER}" != "none-tuned" && -n "\${ROUTER}" ]]; then
   CATEGORY=\$(ollama run "\${ROUTER}" \
-    --system "Classify the query into ONE word: QUICK, CODE, or DEBUG. Reply with only that word." \
-    "\${PROMPT}" 2>/dev/null | tr -d '[:space:]' | head -c 10)
+    --system "Reply with ONE word only — QUICK, CODE, or DEBUG — classifying this query." \
+    "\${PROMPT}" 2>/dev/null | tr -d '[:space:]\n' | head -c 10)
   case "\${CATEGORY^^}" in
-    QUICK) MODEL="\${ROUTER}" ;;   # fast model handles simple lookups
-    *)     MODEL="\${PRIMARY}" ;;  # CODE and DEBUG go to the specialist
+    QUICK) MODEL="\${ROUTER}" ;;
+    *)     MODEL="\${PRIMARY}" ;;
   esac
 else
   MODEL="\${MODEL:-\${PRIMARY}}"
@@ -488,27 +583,26 @@ ollama run "\${MODEL}" --system "\${SYSTEM}" "\${PROMPT}"
 ASKEOF
   sudo chmod +x /usr/local/bin/ask
 
-  # Persist env for fish and bash
   mkdir -p ~/.config/fish/conf.d
   cat > ~/.config/fish/conf.d/ollama.fish << FISHEOF
 set -gx LOCAL_LLM_MODEL "${PRIMARY_MODEL}"
 set -gx LOCAL_LLM_ROUTER "${ROUTER_MODEL}"
-# Offline sysadmin assistant:
-#   ask "how do I configure a static IP with nmcli?"
+# Offline sysadmin assistant — examples:
+#   ask "how do I set a static IP with nmcli?"
 #   journalctl -xe | ask
-#   dmesg | ask "any GPU errors here?"
-#   ask --model ${PRIMARY_MODEL} "complex question"
+#   dmesg | ask "any GPU or driver errors?"
+#   cat /etc/fstab | ask "explain each mount option"
 FISHEOF
   grep -q 'LOCAL_LLM_MODEL' ~/.bashrc 2>/dev/null || \
-    echo "export LOCAL_LLM_MODEL='${PRIMARY_MODEL}'" >> ~/.bashrc
+    printf 'export LOCAL_LLM_MODEL="%s"\nexport LOCAL_LLM_ROUTER="%s"\n' \
+      "${PRIMARY_MODEL}" "${ROUTER_MODEL}" >> ~/.bashrc
 
   echo "✅  Local LLM ready."
-  echo "     Primary model : ${PRIMARY_MODEL}"
-  [[ "${ROUTER_MODEL}" != "none" ]] && \
-    echo "     Router model  : ${ROUTER_MODEL} (handles QUICK queries fast)"
-  echo "     Usage: ask \"how do I configure X\""
-  echo "            journalctl -xe | ask"
-  echo "            dmesg | ask \"any GPU errors?\""
+  echo "     Primary  : ${PRIMARY_MODEL}"
+  [[ "${ROUTER_MODEL}" != "none" ]] && echo "     Router   : ${ROUTER_MODEL}"
+  echo "     Examples : ask \"how do I configure X\""
+  echo "                journalctl -xe | ask"
+  echo "                dmesg | ask \"any GPU errors?\""
 }
 setup_local_llm
 
